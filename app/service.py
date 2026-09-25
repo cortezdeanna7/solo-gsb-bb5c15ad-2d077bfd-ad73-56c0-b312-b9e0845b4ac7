@@ -1,4 +1,4 @@
-"""领域服务:事务提交、余量校验、环路检测、幂等回放、谱系回溯。"""
+"""领域服务:事务提交、可用量(余量-未释放预留)校验、环路检测、幂等回放、谱系回溯。"""
 from __future__ import annotations
 
 import json
@@ -139,6 +139,36 @@ def _stored_result(row: sqlite3.Row, *, replayed: bool) -> s.OpResult:
 
 # ---------------------------------------------------------------- 操作计划
 
+def _reserved_map(
+    conn: sqlite3.Connection, sample_ids: list[str]
+) -> dict[str, float]:
+    """各样品未释放预留的**未核销**锁定总量(与预留模块同口径)。
+
+    核销领用后只把预留明细的未核销部分继续计入锁定量;
+    已释放或已核销部分不再占用可用量。
+    """
+    out: dict[str, float] = {sid: 0.0 for sid in sample_ids}
+    if not sample_ids:
+        return out
+    qmarks = ",".join("?" * len(sample_ids))
+    rows = conn.execute(
+        f"""SELECT ri.sample_id AS sample_id,
+                   SUM(ri.amount - COALESCE(
+                       (SELECT SUM(ci.amount) FROM consumption_items ci
+                         WHERE ci.reservation_no = ri.reservation_no
+                           AND ci.sample_id = ri.sample_id), 0)) AS reserved
+              FROM reservation_items ri
+              JOIN reservations r ON r.reservation_no = ri.reservation_no
+             WHERE r.status = 'active'
+               AND ri.sample_id IN ({qmarks})
+             GROUP BY ri.sample_id""",
+        sample_ids,
+    ).fetchall()
+    for row in rows:
+        out[row["sample_id"]] = _r(row["reserved"])
+    return out
+
+
 @dataclass
 class Plan:
     """单个操作通过全部校验后得到的落库计划(纯数据,便于测试)。"""
@@ -200,14 +230,18 @@ def _plan_aliquot(conn: sqlite3.Connection, op: s.AliquotOp) -> Plan:
         ])
 
     total = _r(sum(o.amount for o in op.outputs))
-    if total > parent["remaining"] + _EPS:
+    remaining = _r(parent["remaining"])
+    locked = _reserved_map(conn, [op.parent_id])[op.parent_id]
+    available = _r(remaining - locked)
+    if total > available + _EPS:
         raise ConflictError([
             _conflict(
                 "insufficient_balance",
-                f"父样品 {op.parent_id} 余量 {parent['remaining']} {unit} 不足,"
-                f"本次分装需要 {total} {unit}",
+                f"父样品 {op.parent_id} 可用量 {available} {unit} 不足,"
+                f"本次分装需要 {total} {unit}"
+                f"(当前余量 {remaining},未释放预留 {locked})",
                 op=op, sample_id=op.parent_id,
-                requested=total, available=_r(parent["remaining"]),
+                requested=total, available=available,
             )
         ])
 
@@ -262,6 +296,7 @@ def _plan_merge(conn: sqlite3.Connection, op: s.MergeOp) -> Plan:
 
     unit = op.unit or sources[0][0]["unit"]
     total = _r(sum(a for _, a in sources))
+    reserved = _reserved_map(conn, [row["sample_id"] for row, _ in sources])
 
     for row, amount in sources:
         if row["unit"] != unit:
@@ -272,14 +307,18 @@ def _plan_merge(conn: sqlite3.Connection, op: s.MergeOp) -> Plan:
                     op=op, sample_id=row["sample_id"],
                 )
             ])
-        if amount > row["remaining"] + _EPS:
+        remaining = _r(row["remaining"])
+        locked = reserved.get(row["sample_id"], 0.0)
+        available = _r(remaining - locked)
+        if amount > available + _EPS:
             raise ConflictError([
                 _conflict(
                     "insufficient_balance",
-                    f"输入 {row['sample_id']} 余量 {row['remaining']} {unit} 不足,"
-                    f"本次需要 {amount} {unit}",
+                    f"输入 {row['sample_id']} 可用量 {available} {unit} 不足,"
+                    f"本次需要 {amount} {unit}"
+                    f"(当前余量 {remaining},未释放预留 {locked})",
                     op=op, sample_id=row["sample_id"],
-                    requested=amount, available=_r(row["remaining"]),
+                    requested=amount, available=available,
                 )
             ])
 
@@ -391,35 +430,6 @@ def _shortest_path(
         cur = prev.get(cur)
     path.reverse()
     return path
-
-
-def _reserved_map(
-    conn: sqlite3.Connection, sample_ids: list[str]
-) -> dict[str, float]:
-    """各样品未释放预留的**未核销**锁定总量(与预留模块同口径)。
-
-    核销领用后只把预留明细的未核销部分继续计入锁定量。
-    """
-    out: dict[str, float] = {sid: 0.0 for sid in sample_ids}
-    if not sample_ids:
-        return out
-    qmarks = ",".join("?" * len(sample_ids))
-    rows = conn.execute(
-        f"""SELECT ri.sample_id AS sample_id,
-                   SUM(ri.amount - COALESCE(
-                       (SELECT SUM(ci.amount) FROM consumption_items ci
-                         WHERE ci.reservation_no = ri.reservation_no
-                           AND ci.sample_id = ri.sample_id), 0)) AS reserved
-              FROM reservation_items ri
-              JOIN reservations r ON r.reservation_no = ri.reservation_no
-             WHERE r.status = 'active'
-               AND ri.sample_id IN ({qmarks})
-             GROUP BY ri.sample_id""",
-        sample_ids,
-    ).fetchall()
-    for row in rows:
-        out[row["sample_id"]] = _r(row["reserved"])
-    return out
 
 
 def _plan_dispose(conn: sqlite3.Connection, op: s.DisposeOp) -> Plan:

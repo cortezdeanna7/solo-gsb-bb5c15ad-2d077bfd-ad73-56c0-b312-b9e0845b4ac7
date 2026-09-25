@@ -221,15 +221,28 @@ def test_consume_unknown_reservation_404(client):
 
 
 def test_consume_insufficient_sample_balance(client):
-    """余量被不感知预留的分装取出后可能低于锁定量,此时按样品余量拦截。"""
+    """盘点调账后余量可能低于锁定量,此时按样品余量拦截。
+
+    分装/合并/销毁出库均按可用量(余量-未释放预留)校验,不会把余量
+    压到锁定量之下;盘点确认的调整量不写预留校验,因此调账后仍可能
+    出现 余量 < 锁定量,核销领用按样品余量兜底拦截。
+    """
     _sample(client, "OP-1", "S1", 100)
     _reserve(client, "RSV-1", [{"sample_id": "S1", "amount": 30}])
-    # 分装 80 出去(分装只看余量):余量 20、锁定仍 30
-    r = client.post("/api/v1/operations/aliquot", json={
-        "type": "aliquot", "op_no": "OP-2", "parent_id": "S1",
-        "outputs": [{"sample_id": "A1", "amount": 80}],
+    # 盘点确认把余量调账到 20(低于锁定 30):余量 20、锁定仍 30
+    r = client.post("/api/v1/stocktakes", json={
+        "stocktake_no": "STK-1", "items": [{"sample_id": "S1"}],
     })
     assert r.status_code == 200, r.text
+    r = client.post("/api/v1/stocktakes/STK-1/submit", json={
+        "items": [{"sample_id": "S1", "counted_amount": 20}],
+    })
+    assert r.status_code == 200, r.text
+    r = client.post("/api/v1/stocktakes/STK-1/confirm", json={
+        "operator": "张库管", "reason": "蒸发损耗调账",
+    })
+    assert r.status_code == 200, r.text
+    assert _availability(client, "S1")["remaining"] == 20.0
 
     # 未核销量 30 足够,但样品余量仅 20 -> 409 insufficient_balance,整单不变
     r = _consume(client, "CV-BAD", "RSV-1", [{"sample_id": "S1", "amount": 25}])
