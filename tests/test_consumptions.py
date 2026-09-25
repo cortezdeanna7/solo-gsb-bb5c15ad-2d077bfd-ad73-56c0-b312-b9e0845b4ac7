@@ -221,15 +221,28 @@ def test_consume_unknown_reservation_404(client):
 
 
 def test_consume_insufficient_sample_balance(client):
-    """余量被不感知预留的分装取出后可能低于锁定量,此时按样品余量拦截。"""
+    """样品余量因盘亏等非谱系调整低于未核销量时,核销按样品余量拦截。"""
     _sample(client, "OP-1", "S1", 100)
     _reserve(client, "RSV-1", [{"sample_id": "S1", "amount": 30}])
-    # 分装 80 出去(分装只看余量):余量 20、锁定仍 30
+
+    # 分装不再能绕过预留锁定:余量 100、锁定 30 时,分装 80(>可用 70)被拒,
+    # 谱系与流水均不写入,余量仍为 100
     r = client.post("/api/v1/operations/aliquot", json={
         "type": "aliquot", "op_no": "OP-2", "parent_id": "S1",
         "outputs": [{"sample_id": "A1", "amount": 80}],
     })
-    assert r.status_code == 200, r.text
+    assert r.status_code == 409
+    c = r.json()["conflicts"][0]
+    assert c["code"] == "insufficient_available"
+    assert c["requested"] == 80.0
+    assert c["available"] == 70.0
+    assert _availability(client, "S1")["remaining"] == 100.0
+
+    # 直接构造「余量低于未核销量」的盘亏状态(不经过谱系操作),
+    # 验证核销仍按样品余量兜底拦截
+    client.db.execute(
+        "UPDATE samples SET remaining = 20 WHERE sample_id = 'S1'"
+    )
 
     # 未核销量 30 足够,但样品余量仅 20 -> 409 insufficient_balance,整单不变
     r = _consume(client, "CV-BAD", "RSV-1", [{"sample_id": "S1", "amount": 25}])

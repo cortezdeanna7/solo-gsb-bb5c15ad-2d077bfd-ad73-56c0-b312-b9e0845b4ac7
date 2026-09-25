@@ -61,14 +61,14 @@ def test_sampling_aliquot_merge_and_idempotency(client):
     assert r.json()["remaining"]["S0"] == 10.0
     assert set(r.json()["samples_created"]) == {"A1", "A2"}
 
-    # 余量不足:再取 15 失败
+    # 可用量不足:再取 15 失败(无预留时可用量=余量)
     r = client.post("/api/v1/operations/aliquot", json={
         "type": "aliquot", "op_no": "OP-3", "parent_id": "S0",
         "outputs": [{"sample_id": "A3", "amount": 15}],
     })
     assert r.status_code == 409
     c = r.json()["conflicts"][0]
-    assert c["code"] == "insufficient_balance"
+    assert c["code"] == "insufficient_available"
     assert c["op_no"] == "OP-3"
     assert c["sample_id"] == "S0"
     assert c["requested"] == 15.0
@@ -188,7 +188,7 @@ def test_batch_commit_and_atomic_rollback(client):
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "committed"
 
-    # 整批中第二条余量不足 -> 全部回滚(取样也不存在)
+    # 整批中第二条可用量不足 -> 全部回滚(取样也不存在)
     bad = {
         "batch_id": "B-2",
         "operations": [
@@ -201,7 +201,7 @@ def test_batch_commit_and_atomic_rollback(client):
     r = client.post("/api/v1/batch", json=bad)
     assert r.status_code == 409
     c = r.json()["conflicts"][0]
-    assert c["code"] == "insufficient_balance"
+    assert c["code"] == "insufficient_available"
     assert c["batch_index"] == 1
     assert c["op_no"] == "B4"
 
@@ -251,7 +251,7 @@ def test_batch_validate_dry_run_does_not_write(client):
     data = r.json()
     assert data["valid"] is False
     assert data["conflicts"][0]["batch_index"] == 1
-    assert data["conflicts"][0]["code"] == "insufficient_balance"
+    assert data["conflicts"][0]["code"] == "insufficient_available"
 
     # dry-run 未写库
     r = client.get("/api/v1/samples")

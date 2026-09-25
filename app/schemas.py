@@ -28,7 +28,10 @@ class AliquotPart(BaseModel):
 
 
 class AliquotOp(BaseModel):
-    """分装:把同一个父样品拆成多个新子样品。"""
+    """分装:把同一个父样品拆成多个新子样品。
+
+    总取出量不得超过父样品可用量(当前余量 − 未释放预留的未核销部分)。
+    """
 
     type: Literal["aliquot"]
     op_no: str = Field(min_length=1)
@@ -51,7 +54,11 @@ class MergeSource(BaseModel):
 
 
 class MergeOp(BaseModel):
-    """合并:把多个来源样品(可部分取用)汇到输出样品;输出可为已有样品。"""
+    """合并:把多个来源样品(可部分取用)汇到输出样品;输出可为已有样品。
+
+    每个输入的取出量不得超过该样品可用量
+    (当前余量 − 未释放预留的未核销部分)。
+    """
 
     type: Literal["merge"]
     op_no: str = Field(min_length=1)
@@ -111,7 +118,7 @@ class BatchRequest(BaseModel):
 # ---------------------------------------------------------------- 冲突与结果
 
 class Conflict(BaseModel):
-    code: str = Field(description="冲突类型,如 insufficient_balance / cycle_detected")
+    code: str = Field(description="冲突类型,如 insufficient_available / cycle_detected")
     message: str
     op_no: Optional[str] = None
     batch_index: Optional[int] = Field(default=None, description="批量提交中从 0 开始的下标")

@@ -200,14 +200,20 @@ def _plan_aliquot(conn: sqlite3.Connection, op: s.AliquotOp) -> Plan:
         ])
 
     total = _r(sum(o.amount for o in op.outputs))
-    if total > parent["remaining"] + _EPS:
+    # 分装只能动用「未被活跃预留锁定」的部分:可用量 = 当前余量 − 未核销锁定,
+    # 已释放预留与已核销部分不再占用,保证分装后可用量不为负、预留后续可核销
+    locked = _reserved_map(conn, [op.parent_id]).get(op.parent_id, 0.0)
+    remaining = _r(parent["remaining"])
+    available = _r(remaining - locked)
+    if total > available + _EPS:
         raise ConflictError([
             _conflict(
-                "insufficient_balance",
-                f"父样品 {op.parent_id} 余量 {parent['remaining']} {unit} 不足,"
-                f"本次分装需要 {total} {unit}",
+                "insufficient_available",
+                f"父样品 {op.parent_id} 可用量 {available} {unit} 不足,"
+                f"本次分装需要 {total} {unit}"
+                f"(当前余量 {remaining},未释放预留 {locked})",
                 op=op, sample_id=op.parent_id,
-                requested=total, available=_r(parent["remaining"]),
+                requested=total, available=available,
             )
         ])
 
@@ -263,6 +269,13 @@ def _plan_merge(conn: sqlite3.Connection, op: s.MergeOp) -> Plan:
     unit = op.unit or sources[0][0]["unit"]
     total = _r(sum(a for _, a in sources))
 
+    # 合并各输入同样只能动用「未被活跃预留锁定」的部分,口径与分装/销毁一致:
+    # 可用量 = 当前余量 − 未核销锁定;已释放预留与已核销部分不再占用。
+    # 逐项收集全部可用量冲突后一次性抛出(整次操作不写谱系与流水)。
+    reserved = _reserved_map(
+        conn, [row["sample_id"] for row, _ in sources]
+    )
+    conflicts: list[s.Conflict] = []
     for row, amount in sources:
         if row["unit"] != unit:
             raise ConflictError([
@@ -272,16 +285,20 @@ def _plan_merge(conn: sqlite3.Connection, op: s.MergeOp) -> Plan:
                     op=op, sample_id=row["sample_id"],
                 )
             ])
-        if amount > row["remaining"] + _EPS:
-            raise ConflictError([
-                _conflict(
-                    "insufficient_balance",
-                    f"输入 {row['sample_id']} 余量 {row['remaining']} {unit} 不足,"
-                    f"本次需要 {amount} {unit}",
-                    op=op, sample_id=row["sample_id"],
-                    requested=amount, available=_r(row["remaining"]),
-                )
-            ])
+        remaining = _r(row["remaining"])
+        locked = reserved.get(row["sample_id"], 0.0)
+        available = _r(remaining - locked)
+        if amount > available + _EPS:
+            conflicts.append(_conflict(
+                "insufficient_available",
+                f"合并输入 {row['sample_id']} 可用量 {available} {unit} 不足,"
+                f"本次需要 {amount} {unit}"
+                f"(当前余量 {remaining},未释放预留 {locked})",
+                op=op, sample_id=row["sample_id"],
+                requested=amount, available=available,
+            ))
+    if conflicts:
+        raise ConflictError(conflicts)
 
     output = _get_sample(conn, op.output_id)
     if output is not None and output["unit"] != unit:

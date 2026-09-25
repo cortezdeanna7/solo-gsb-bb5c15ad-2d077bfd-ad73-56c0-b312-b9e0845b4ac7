@@ -40,7 +40,7 @@ app = FastAPI(
     description=(
         "取样 / 分装 / 合并 / 销毁操作的事务化追溯服务:\n"
         "- 每个操作带全局唯一操作号,重复提交幂等返回原结果\n"
-        "- 事务内校验父样品余量、禁止谱系环路\n"
+        "- 事务内按可用量(余量-未释放预留的未核销部分)校验分装父样品与合并输入、禁止谱系环路\n"
         "- 支持批量提交与 dry-run 预校验,冲突返回操作号与批内定位\n"
         "- 按样品回溯完整来源/去向,并提供余量(账本)校验\n"
         "- 销毁/报废:一次提交多个样品的销毁量与原因,\n"
@@ -87,7 +87,7 @@ app = FastAPI(
         "  字典序最小确定;返回入选样品,并为每个未入选样品列出与参考或入选样品共享的根,"
         "  分装/合并后重新查询按当前谱系实时重算"
     ),
-    version="1.9.0",
+    version="1.9.1",
     lifespan=lifespan,
 )
 
@@ -240,7 +240,7 @@ def _submit_one(
     "/api/v1/operations",
     response_model=s.OpResult,
     tags=["操作"],
-    summary="提交单个取样/分装/合并/销毁操作(按 type 区分)",
+    summary="提交单个取样/分装/合并/销毁操作(按 type 区分);分装/合并按可用量(余量-未释放预留)校验",
 )
 def submit_operation(
     op: s.AnyOp, conn: sqlite3.Connection = Depends(get_conn)
